@@ -1,4 +1,4 @@
-title: "Sameer Kolpekwar"
+title: "Sameer Kolpekwar's Blog"
 author: "Sameer Kolpekwar"
 description: "A blog about my developer experiences"
 
@@ -18,7 +18,7 @@ linkedin_username: "sameer-kolpekwar"
 #########################################################################################
 ######### Nothing below needs to be changed (unless you know what you're doing) #########
 #########################################################################################
-remote_theme: poole/hyde
+theme: minima
 
 rss: rss
 
