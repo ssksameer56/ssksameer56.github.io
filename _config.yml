@@ -18,7 +18,7 @@ linkedin_username: "sameer-kolpekwar"
 #########################################################################################
 ######### Nothing below needs to be changed (unless you know what you're doing) #########
 #########################################################################################
-theme: "slate"
+remote_theme: poole/hyde
 
 rss: rss
 
