@@ -1,0 +1,136 @@
+# What was the issue
+
+The problem at hand was straightforward: our business teams received reports stating that our app was consistently experiencing downtime, while users were unable to utilize the app. This was particularly unacceptable for our e-commerce business, especially during periods of expected high sales or promotional activities. The underlying issue stemmed from our customer app APIs encountering a significant number of 5xx errors, rendering the app unusable. While debugging could resolve 500 errors, addressing 502 and 504 errors presented a more formidable challenge. The primary focus, therefore, revolved around finding solutions for these specific errors.
+
+# How we Found Out
+
+Understanding the root causes of any issue accounts for 80% of the task, as once the cause is identified, the subsequent resolution becomes relatively straightforward. In our case, we employed simple yet effective tools to pinpoint the underlying problems. Firstly, we implemented extensive logging on our APIs, ensuring that any potentially problematic component was adequately logged. Secondly, our skilled infrastructure team had already established Prometheus and Grafana to extract essential metrics from our applications, leveraging our Kubernetes cluster. Additionally, Grafana provided visibility into the ingress metrics, allowing us to monitor incoming and outgoing requests within our system.
+
+By implementing these measures, we gained comprehensive insights into the entire lifecycle of each request and the overall system health. This included:
+
+1. NGINX Logs - capturing the arrival and departure of requests, along with their respective responses, or the lack thereof.
+2. Application Logs - providing crucial information on how the requests were processed within our applications.
+3. Prometheus - offering vital statistics and metrics to evaluate the overall performance of our system.
+4. Grafana Alerts - promptly notifying us whenever an API went down or operated below predefined thresholds.
+
+With this comprehensive monitoring infrastructure in place, we were equipped with the necessary visibility to identify issues, allowing us to take timely actions for resolution.
+
+# Probable Causes
+
+Our services operate on a remarkable technology called Kubernetes, which is like a magical spellbook for managing our system. However, we were in for a surprise when we discovered that it wasn't a one-size-fits-all solution capable of instantly fixing all our issues and making our services fault-tolerant (no "sudo apply no-downtime" command to be found, even after thorough searching).
+
+Once we had the infrastructure in place (thanks to our proactive infra team, who did the heavy lifting while we were feeling a bit lazy), we could closely monitor the system whenever reports of app malfunctions came pouring in. The alert system we set up played a significant role in speeding up the process of identifying the root causes.
+
+The first reason behind the hiccups was rather evident: increased user activity. As the number of daily active users (DAU) soared, our systems faced a surge in workload. Thanks to Prometheus, we could observe this spike in load on our servers, which resulted in slower responses and, in turn, more unserved requests. This unfortunate chain of events likely contributed to a higher occurrence of errors.
+
+The second reason was a bit trickier to uncover but not impossible. Apart from the aforementioned scenario, our APIs randomly threw 5xx errors, causing minor annoyance to our developers. After some investigation, we discovered that these errors coincided with our deployments. Yes, you heard it right—every time we deployed our APIs, they experienced a brief downtime. Our skilled sleuths traced this connection by meticulously examining the logs, matching the occurrence of 5xx errors with the start of new pods during deployments.
+
+As an organisation that embraces Continuous Integration and Continuous Deployment (CI/CD), we conduct numerous deployments on a daily basis. Some services can experience a staggering 15 to 20 deployments in a single day, as we continuously push new features into production. Consequently, it became crucial to resolve the issue of API downtime during deployments. We simply couldn't afford to have specific release windows with downtime for our e-commerce business, especially considering the frequency at which our tech team delivers updates.
+
+Addressing the second issue of experiencing downtime during periods of high DAU was relatively straightforward. The underlying cause was clear: our servers struggled to handle the increased request load. The solution was to scale up the number of servers at our disposal. Of course, if we had an abundance of financial resources lying around (here's looking at you, US Fed), it would have been a breeze. However, our challenge was to achieve this while keeping costs as low as possible and utilizing resources efficiently.
+
+Now, let's delve into how we tackled both of these issues head-on and emerged victorious.
+
+# Rolling in the Deep-loyments
+
+Let's dive into our first challenge - the occurrence of 5xx errors during deployments. Addressing this issue demanded a thorough grasp of key Kubernetes concepts, such as probes, the pod lifecycle, and the interactions between deployments, services, and the Kubernetes API.
+
+## IPs in a Pod
+
+In the realm of Kubernetes, the Service layer acts as the gateway between the outside world and our APIs. When requests are intended for our API, they are directed to the Service, which then forwards them to the appropriate pod (although this part remains hidden from view). During a code deployment on Kubernetes, new pods are created while the old ones are gracefully terminated. The Service maintains a table that interacts with the pods using their internal IP addresses. Whenever pods are refreshed, the Service updates its records accordingly. This is a simplified explanation, but it should suffice for now.
+
+Our initial assumption was that Kubernetes would automatically update its records and reroute traffic exclusively to the running pods. Unfortunately, this wasn't the case. The process of rolling deployments and updating the Service's records is asynchronous, which meant it became our responsibility to synchronize them effectively. This synchronization was crucial to ensure minimal downtime whenever we refreshed pods, minimizing disruptions to our services.
+
+## Not so Amazing Grace-ful Shutdown
+
+The second reason behind the occurrence of 5xx errors during deployment stemmed from the absence of graceful shutdowns in our APIs. In an ideal scenario, when a pod is being terminated, you would expect it to gracefully clean up any ongoing requests before bidding farewell. However, that wasn't the case for us.
+
+In Kubernetes, the termination of a pod follows a relatively straightforward process. Similar to an operating system, Kubernetes sends a `SIGTERM` signal to the targeted pod, allowing a grace period of 30 seconds for the processes inside the pod to shut down gracefully. If the processes do not terminate within this timeframe, Kubernetes forcefully kills the pod. Unfortunately, without a proper graceful shutdown mechanism in place, our APIs abruptly exited upon receiving the `SIGTERM` signal, resulting in the termination of ongoing requests. Recognizing this issue, we attempted to mitigate it by introducing a 5-second wait period before shutting down the pod. However, to our surprise, this delay merely postponed the problem by 5 seconds.
+
+As I mentioned earlier, the termination of pods and the update of service registers occur asynchronously. Herein lies the crux of the issue. When a pod receives the termination signal, it initiates the exit process as configured, but the corresponding service remains unaware that the pod is about to terminate. Consequently, the service continues to send traffic to the soon-to-be-terminated pod until it is eventually terminated. Only then does the service update its registers accordingly. In the meantime, the ongoing requests keep encountering 5xx errors due to this lack of synchronization.
+
+This asynchronous nature of pod termination and service register updates became a key factor contributing to the persistence of 5xx errors during deployments. However, fear not, as we devised effective solutions to overcome these challenges, which I will detail shortly.
+
+
+## Fixing These Issues
+
+### YAML Changes
+
+We resolved the issues mentioned earlier by understanding how Kubernetes manages pods. To handle this, we made use of two important settings called `liveness` and `readiness` probes when setting up our pods. These probes help Kubernetes determine if the pod is healthy and ready to work. For pods that host APIs, the liveness probe checks if the pod's process is running, while the readiness probe ensures that the pod is prepared to handle incoming traffic.
+
+Once the readiness probe indicates that the pod is ready, Kubernetes starts sending traffic to it until the probe indicates otherwise, indicating that the pod is no longer ready to serve requests.
+
+When a pod receives a `SIGTERM` signal, it is important for it to finish processing the ongoing requests, inform Kubernetes that it can no longer handle requests, and gracefully shut down. This functionality was achieved using readiness probes. Upon receiving the `SIGTERM` signal, we set the readiness probes to false, indicating that the pod is not ready to accept new requests. We then waited for a specific duration to allow Kubernetes to recognize this change and stop sending requests to the pod. To ensure completion of any remaining requests, we implemented a grace period after this waiting period.
+
+To determine the durations involved, we relied on the values of `failureThreshold` and `delayInSeconds` specified in the Kubernetes configuration. Kubernetes waits for `failureThreshold` multiplied by `delayInSeconds` before acknowledging that the pod is no longer ready to handle traffic and stops sending requests to it. However, even after this acknowledgment, there might still be in-flight requests that need to be completed. To account for this scenario, we incorporated an additional `gracePeriod` in our code.
+
+### Coding Better APIs
+
+In our implementation of the APIs, particularly in Go, we leveraged the concept of context to facilitate graceful handling of requests. Go provides a built-in context package that enables synchronisation and cancellations, which we extensively utilised in our codebase.
+
+When processing a request, we created a new context derived from the original request context provided by Gin (a popular Go web framework). This derived context was then utilised for making any additional requests to resources such as databases, caches, or external APIs. This approach allowed us to effectively control the execution flow of a request. In the event that the original request was cancelled, we could propagate the cancellation to the underlying calls as well, ensuring a consistent and synchronised cancellation across the request chain.
+
+Furthermore, contexts provided us with the ability to set timeouts. We utilised this feature to manage and terminate long-running requests, preventing them from becoming "zombie" requests that consume resources indefinitely. By incorporating timeouts within our contexts, we could ensure that requests were efficiently managed and terminated if they exceeded the specified time limit.
+
+---
+
+Implementing these measures had a significant positive impact on our 5xx error rates. We observed a notable improvement in a graph that tracked the number of 5xx errors before and after this deployment.
+![[Pasted image 20230617104827.png]]
+
+The strategy I described above for graceful shutdown and handling 5xx errors is extensively explained in the blog post titled "Graceful Shutdown in Node" (available at [this link](https://blog.risingstack.com/graceful-shutdown-node-js-kubernetes/)). 
+
+Although the approach hasn't completely eliminated the occurrence of 5xx errors, it has significantly reduced them to negligible levels. Our primary objective was to ensure minimal impact on the business, and I am pleased to say that we have successfully achieved that goal.
+
+
+# Scaling Up
+
+Kubernetes is an incredible technology that helps us easily adjust our APIs and microservices as needed. It's a go-to solution for making our services robust and preventing downtime. There are two types of scaling in Kubernetes: vertical scaling and horizontal scaling.
+
+Vertical scaling means increasing the resources available to a pod so that it can handle more traffic without any issues. Horizontal scaling involves adding more replicas or pods to our deployment.
+
+Vertical scaling might sound tempting, but it involves creating a new pod with more resources. Sometimes, the required resources might not be available in our cluster, causing delays and longer response times. Larger pods can also waste resources. Think of your Kubernetes node like a picnic basket, and a large pod is like trying to fit a huge cheese wheel inside it. It might take up all the space, leaving no room for anything else.
+
+On the other hand, horizontal scaling is easier and better. We can simply add more pods to handle the increased workload. With horizontal scaling, we can keep each pod smaller, allowing them to handle fewer requests while distributing the load among multiple pods. This approach gives us more flexibility and makes better use of our resources.
+
+## Horizontal Scaling
+
+Kubernetes provides framework called HPA(Horizontal Pod Autoscaler) to help scale your deployments for various scenarios. There are guides and books on how understand and use this technology, but I'll explain in simple terms here. With HPA, you can configure metrics and thresholds that HPA keeps an eye on for your deployment. If the values for your deployment breach these metrics, HPA tries to bring them back to normal levels. What metrics HPA needs to keep track of varies, but the most used ones are memory consumption, CPU usage, incoming requests, kafka lag - atleast we've used these in our organisation. 
+
+The game is simple, configure the above metrics properly so that HPA scales your services properly while you lie back, relax and marvel at your own genius. But how to find the correct thresholds?
+
+### Load Testing - Finding Benchmarks
+#### CPU and Memory
+
+To determine the appropriate CPU and memory benchmarks, you can follow a simple method: conduct a load test on a single pod. Start by creating a pod and gradually increase the load using a tool like k6. Keep an eye on the API's performance during the test. K6 provides useful metrics that can help you find the point at which the API starts to struggle.
+
+For example, you can focus on the p(95) latency. If you want the latency to be under 100ms, monitor the p(95) latency with different workloads using k6. Observe how the API behaves under various conditions. Once you notice the p(95) latency exceeding 100ms, check the memory and CPU usage at that point. This will indicate when your service's performance has degraded, and you might need to consider intervention from HPA (Horizontal Pod Autoscaler).
+
+#### Incoming Requests
+
+Another approach to address this issue is to scale your API according to the number of incoming requests. However, it's important to note that this method relies on the assumption that you can predict your traffic or that there is a time delay between when HPA is notified and when the actual load arrives. This delay provides a window of time to scale the pods accordingly.
+
+HPA (Horizontal Pod Autoscaler) enables you to incorporate queries based on Prometheus. By utilising the ingress request metric and establishing a threshold, you can effectively manage the scaling of your API.
+
+---
+We experimented with both of these approaches for our services, but unfortunately, we didn't observe significant benefits, and they didn't perform as expected. We encountered two main challenges. Firstly, predicting traffic patterns over a 24-hour period proved to be challenging. Secondly, it was difficult to detect incoming traffic in advance and create a suitable window for scaling pods accordingly. As a result, using HPA in our specific scenarios became quite challenging.
+
+However, it's worth noting that there are numerous existing resources and case studies that discuss the effective utilization of HPA. Although we didn't achieve immediate success with HPA, we remain committed to refining our approach and leveraging it for better scalability in the future.
+
+### Configuring Deployment
+
+However, we didn't let those metrics go to waste. Instead, we utilized them to fine-tune the values for each pod in our services, such as determining the appropriate memory consumption, required CPU resources, and the optimal number of requests it can effectively handle. Since relying solely on HPA didn't solve our challenges, we opted for a different approach.
+
+By observing the traffic patterns over a 7-day window, we were able to identify periods of high and low activity, as well as periods of lull. Using basic mathematics and statistical analysis, we arrived at a number—the required number of pods—to handle the service across all types of loads.
+
+Consequently, our service now operates at a constant load, designed to accommodate periods of low activity, average workload, and high activity. In my opinion, the incremental operational benefits gained from scaling and de-scaling between all these loads do not outweigh the investment in developer effort that would be required.
+
+### Resources
+
+- [Express.js Health Check and Graceful Shutdown](https://expressjs.com/en/advanced/healthcheck-graceful-shutdown.html)
+- [Autoscaling in Kubernetes: Why Doesn't the Horizontal Pod Autoscaler Work for Me?](https://medium.com/expedia-group-tech/autoscaling-in-kubernetes-why-doesnt-the-horizontal-pod-autoscaler-work-for-me-5f0094694054)
+- [Handling Client Requests Properly with Kubernetes](https://freecontent.manning.com/handling-client-requests-properly-with-kubernetes/)
+- [Prescaling: Scaling Kubernetes Workloads Ahead of Traffic](https://tech.bedrockstreaming.com/2022/02/03/prescaling.html)
+- [YouTube: Autoscaling Web Applications on Kubernetes](https://www.youtube.com/watch?v=tNlQaBUnd1E&embeds_euri=https%3A%2F%2Fwww.digitalocean.com%2F&feature=emb_imp_woyt)
+- [Stack Overflow: Explanation on Handling Client Requests in Kubernetes](https://stackoverflow.com/a/69921889)
+
+*Special thanks to ChatGPT for its valuable assistance in editing this blog. Its intelligent suggestions and revisions greatly improved the quality of the content*
